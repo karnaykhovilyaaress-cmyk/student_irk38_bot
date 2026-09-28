@@ -50,6 +50,9 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# id постов, для которых уже запрошено подтверждение /draw
+_pending_draw = {"confirm": False}
+
 STOP_WORDS = [
     "кредит", "займ", "заработок", "казино", "ставки", "букмекер",
     "наркотик", "мефедрон", "соль", "спайс", "закладк",
@@ -99,6 +102,7 @@ class SubmitState(StatesGroup):
     waiting_text = State()
     waiting_edit = State()
     waiting_answer = State()
+    waiting_broadcast = State()
 
 
 # ============================================================
@@ -141,6 +145,10 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         banned_at TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS giveaway (
+        user_id INTEGER PRIMARY KEY,
+        joined_at TEXT
+    )""")
     conn.commit(); conn.close()
 
 
@@ -152,6 +160,7 @@ def now_irk():
     return datetime.now(timezone.utc) + timedelta(hours=8)
 
 
+# ---------- БАНЫ ----------
 def is_banned(user_id):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute("SELECT 1 FROM banned WHERE user_id=?", (user_id,)).fetchone()
@@ -172,6 +181,7 @@ def unban_user(user_id):
     conn.commit(); conn.close()
 
 
+# ---------- СПАМ-ЛОГ ----------
 def log_spam(user_id, kind):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT INTO spam_log (user_id, kind, created_at) VALUES (?, ?, ?)",
@@ -191,6 +201,7 @@ def count_user_posts(user_id, hours=None):
     return n
 
 
+# ---------- ПОСТЫ ----------
 def add_post(category, text, author_id, author_name):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
@@ -211,6 +222,15 @@ def get_post(post_id):
     return row
 
 
+def get_pending_posts(limit=30):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, category, text, author_id, author_name FROM posts "
+        "WHERE status='pending' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
 def set_post_text(post_id, new_text):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE posts SET text=? WHERE id=?", (new_text, post_id))
@@ -227,6 +247,7 @@ def set_post_status(post_id, status, published_msg_id=None):
     conn.commit(); conn.close()
 
 
+# ---------- ОТКЛОНЕНИЯ ----------
 def inc_reject(user_id):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute("SELECT count FROM rejects WHERE user_id=?", (user_id,)).fetchone()
@@ -261,6 +282,7 @@ def was_reject_notified(user_id):
     return bool(row and row[0])
 
 
+# ---------- ОЧЕРЕДЬ ----------
 def add_to_queue(post_id):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT OR IGNORE INTO queue (post_id, added_at) VALUES (?, ?)",
@@ -288,6 +310,16 @@ def queue_size():
     return n
 
 
+def get_queue_list(limit=20):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT p.id, p.category, p.text FROM queue q JOIN posts p ON p.id=q.post_id "
+        "ORDER BY q.added_at ASC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
+# ---------- СТАТИСТИКА ----------
 def stat_get(key, default=0):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute("SELECT value FROM stats WHERE key=?", (key,)).fetchone()
@@ -329,6 +361,41 @@ def published_today_count():
         except Exception:
             pass
     return n
+
+
+# ---------- РОЗЫГРЫШ ----------
+def add_giveaway_participant(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT OR IGNORE INTO giveaway (user_id, joined_at) VALUES (?, ?)",
+                 (user_id, now_iso()))
+    conn.commit(); conn.close()
+
+
+def is_giveaway_participant(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT 1 FROM giveaway WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_giveaway_participants():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id FROM giveaway").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def get_giveaway_count():
+    conn = sqlite3.connect(DB_PATH)
+    n = conn.execute("SELECT COUNT(*) FROM giveaway").fetchone()[0]
+    conn.close()
+    return n
+
+
+def clear_giveaway():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM giveaway")
+    conn.commit(); conn.close()
 
 
 # ============================================================
@@ -421,9 +488,8 @@ def get_admin_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="Очередь", callback_data="admin_queue")],
-        [InlineKeyboardButton(text="Забанить по ID", callback_data="admin_ban_start")],
-        [InlineKeyboardButton(text="Разбанить по ID", callback_data="admin_unban_start")],
-        [InlineKeyboardButton(text="Розыгрыш", callback_data="giveaway_start")],
+        [InlineKeyboardButton(text="Ожидают модерации", callback_data="admin_pending")],
+        [InlineKeyboardButton(text="Розыгрыш — участники", callback_data="giveaway_stats")],
         [InlineKeyboardButton(text="Опубликовать вопрос дня", callback_data="daily_q_now")],
     ])
 
@@ -434,25 +500,50 @@ def get_admin_main_keyboard():
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
+    args = message.text.split(maxsplit=1)
+    payload = args[1].strip() if len(args) > 1 else ""
+
     if is_banned(message.from_user.id):
         await message.answer("Ты забанен и не можешь отправлять сообщения.")
+        return
+
+    if payload == "giveaway":
+        if message.from_user.id == ADMIN_ID:
+            await message.answer(
+                "Ты админ — тебе не нужно участвовать в розыгрыше.\n"
+                "Админ-панель:",
+                reply_markup=get_admin_main_keyboard())
+            return
+        already = is_giveaway_participant(message.from_user.id)
+        add_giveaway_participant(message.from_user.id)
+        if already:
+            await message.answer(
+                "Ты уже участвуешь в розыгрыше.\n\n"
+                "Следи за каналом @tainyi_politex — победителя выберем случайно.",
+                reply_markup=get_user_keyboard())
+        else:
+            await message.answer(
+                "Ты участвуешь в розыгрыше!\n\n"
+                "Победителя выберем случайно. Следи за каналом @tainyi_politex.\n\n"
+                "Хочешь отправить анонимку? Жми «Отправить анонимно».",
+                reply_markup=get_user_keyboard())
         return
 
     if message.from_user.id == ADMIN_ID:
         await message.answer(
             "Привет, админ!\n\n"
-            "Ты — модератор «Тайного политеха».\n\n"
-            "Сюда приходят анонимки. У каждой — кнопки действий:\n"
-            "— Опубликовать (сразу)\n"
-            "— В очередь (по расписанию, 2 часа)\n"
-            "— Редактировать\n"
-            "— Отклонить\n"
-            "— Ответить от имени канала\n\n"
             "Команды:\n"
-            "/backup — прислать файл базы (резервная копия)\n"
+            "/admin — админ-панель\n"
+            "/pending — посты, ожидающие модерации\n"
+            "/queue — очередь на публикацию\n"
+            "/backup — прислать файл базы\n"
             "/restore — восстановить базу (пришли .db с подписью /restore)\n"
             "/draw — провести розыгрыш\n"
-            "/admin — эта панель\n\n"
+            "/ban <id> — забанить пользователя\n"
+            "/unban <id> — разбанить\n"
+            "/post <текст> — опубликовать текст в канал\n"
+            "/question — опубликовать вопрос дня\n\n"
             "Админ-панель:",
             reply_markup=get_admin_main_keyboard())
         return
@@ -476,12 +567,21 @@ async def cmd_admin(message: Message):
         await message.answer("Только для админа.")
         return
     await message.answer(
-        "Админ-панель:\n\n"
-        "/backup — прислать файл базы (резервная копия)\n"
-        "/restore — восстановить базу из файла (пришли .db с подписью /restore)\n"
-        "/draw — провести розыгрыш\n"
-        "/admin — эта панель\n\n"
-        "Кнопки:",
+        f"Админ-панель\n\n"
+        f"Опубликовано всего: {stat_get('published_total', 0)}\n"
+        f"Сегодня: {published_today_count()}\n"
+        f"В очереди: {queue_size()}\n"
+        f"Участников розыгрыша: {get_giveaway_count()}\n\n"
+        f"Команды:\n"
+        f"/pending — посты на модерации\n"
+        f"/queue — очередь\n"
+        f"/backup — бэкап\n"
+        f"/restore — восстановление\n"
+        f"/draw — розыгрыш\n"
+        f"/ban <id> — забанить\n"
+        f"/unban <id> — разбанить\n"
+        f"/post <текст> — пост в канал\n"
+        f"/question — вопрос дня",
         reply_markup=get_admin_main_keyboard())
 
 
@@ -519,6 +619,7 @@ async def cmd_backup(message: Message):
                 f"Резервная копия базы.\n\n"
                 f"Опубликовано всего: {stat_get('published_total', 0)}\n"
                 f"В очереди: {queue_size()}\n"
+                f"Участников розыгрыша: {get_giveaway_count()}\n"
                 f"Дата: {now_irk().strftime('%d.%m.%Y %H:%M')}"
             )
         )
@@ -537,9 +638,12 @@ async def cmd_restore(message: Message):
             "Как восстановить базу:\n\n"
             "1. Прикрепи файл `.db` (тот, что получил командой /backup).\n"
             "2. В подписи к файлу напиши `/restore`.\n"
-            "3. Отправь.\n\n"
-            "Пример: выбираешь файл → в поле ввода пишешь /restore → отправляешь."
+            "3. Отправь."
         )
+        return
+    fname = message.document.file_name or ""
+    if not fname.lower().endswith(".db"):
+        await message.answer("Нужен файл с расширением `.db`.")
         return
     try:
         file = await bot.get_file(message.document.file_id)
@@ -676,8 +780,7 @@ async def submit_receive(message: Message, state: FSMContext):
 # МОДЕРАЦИЯ
 # ============================================================
 def format_channel_post(category, text, post_id):
-    tag = f"#{category}"
-    return f"{text}\n\n{tag}  ·  №{post_id}"
+    return f"{text}\n\n#{category}  ·  №{post_id}"
 
 
 async def publish_post(post_id):
@@ -857,8 +960,7 @@ async def admin_answer_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"Ответ на #{pid}\n\n"
         f"Оригинал:\n{row[2]}\n\n"
-        f"Пришли текст ответа — он будет опубликован в канале от имени канала, "
-        f"со ссылкой на #{pid}.\n\n/cancel"
+        f"Пришли текст ответа — он будет опубликован в канале со ссылкой на #{pid}.\n\n/cancel"
     )
     await state.set_state(SubmitState.waiting_answer)
     await callback.answer()
@@ -922,6 +1024,7 @@ async def admin_stats(callback: CallbackQuery):
         f"В очереди на публикацию: {q_size}\n"
         f"Отклонено: {total_rejected}\n"
         f"Забанено: {banned_count}\n"
+        f"Участников розыгрыша: {get_giveaway_count()}\n"
     )
     await callback.message.answer(text)
     await callback.answer()
@@ -932,82 +1035,69 @@ async def admin_queue(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer()
         return
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT p.id, p.category, p.text FROM queue q JOIN posts p ON p.id=q.post_id "
-        "ORDER BY q.added_at ASC").fetchall()
-    conn.close()
+    rows = get_queue_list(limit=20)
     if not rows:
         await callback.message.answer("Очередь пуста.")
         await callback.answer()
         return
     lines = [f"Очередь: {len(rows)} постов\n"]
-    for pid, cat, txt in rows[:20]:
+    for pid, cat, txt in rows:
         short = txt[:80] + ("..." if len(txt) > 80 else "")
         lines.append(f"#{pid} [{cat}] {short}")
     await callback.message.answer("\n".join(lines))
     await callback.answer()
 
 
-@dp.callback_query(F.data == "admin_ban_start")
-async def admin_ban_start(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "admin_pending")
+async def admin_pending(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer()
         return
-    await callback.message.answer("Пришли ID пользователя, которого забанить.")
-    await state.update_data(admin_action="ban")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_unban_start")
-async def admin_unban_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    rows = get_pending_posts(limit=30)
+    if not rows:
+        await callback.message.answer("Нет постов, ожидающих модерации.")
         await callback.answer()
         return
-    await callback.message.answer("Пришли ID пользователя, которого разбанить.")
-    await state.update_data(admin_action="unban")
+    lines = [f"Ожидают модерации: {len(rows)}\n"]
+    for pid, cat, txt, uid, uname in rows:
+        short = txt[:80] + ("..." if len(txt) > 80 else "")
+        lines.append(f"#{pid} [{cat}] {short}")
+    lines.append("")
+    lines.append("Открывай каждую в чате и жми «Опубликовать / В очередь / Отклонить».")
+    await callback.message.answer("\n".join(lines))
     await callback.answer()
-
-
-@dp.message(F.text & F.from_user.func(lambda u: u.id == ADMIN_ID))
-async def admin_free_text(message: Message, state: FSMContext):
-    cur = await state.get_state()
-    data = await state.get_data()
-    action = data.get("admin_action")
-    if not action:
-        return
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("Нужно число — ID пользователя.")
-        return
-    uid = int(raw)
-    if action == "ban":
-        ban_user(uid)
-        await message.answer(f"Пользователь {uid} забанен.")
-    else:
-        unban_user(uid)
-        await message.answer(f"Пользователь {uid} разбанен.")
-    await state.update_data(admin_action=None)
-    await message.answer("Админ-панель:", reply_markup=get_admin_main_keyboard())
 
 
 # ============================================================
 # РОЗЫГРЫШ
 # ============================================================
-@dp.callback_query(F.data == "giveaway_start")
-async def giveaway_start(callback: CallbackQuery):
+@dp.callback_query(F.data == "giveaway_stats")
+async def giveaway_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer()
         return
-    await callback.message.answer(
-        "Розыгрыш — формат:\n\n"
-        "1. Отправь текст анонса в канал от себя.\n"
-        "2. В тексте должна быть кнопка «Участвую» → "
-        f"t.me/{BOT_USERNAME}?start=giveaway\n"
-        "3. Люди заходят, жмут «Участвую» в боте — ты видишь список.\n"
-        "4. Когда решишь — жми /draw, бот выберет случайного.\n\n"
-        "Сейчас просто напиши анонс и опубликуй его в канале."
-    )
+    count = get_giveaway_count()
+    if count == 0:
+        await callback.message.answer(
+            "Участников пока нет.\n\n"
+            "Как запустить розыгрыш:\n"
+            "1. Опубликуй в канале анонс с ссылкой:\n"
+            f"   t.me/{BOT_USERNAME}?start=giveaway\n"
+            "2. Люди жмут ссылку → попадают в бота → автоматически записываются.\n"
+            "3. Когда решишь — жми /draw, бот выберет случайного.\n\n"
+            "После /draw список участников очищается."
+        )
+        await callback.answer()
+        return
+    participants = get_giveaway_participants()
+    lines = [f"Участников: {count}\n"]
+    for uid in participants[:30]:
+        lines.append(f"  • {uid}")
+    if count > 30:
+        lines.append(f"  ... и ещё {count - 30}")
+    lines.append("")
+    lines.append("Когда готов — /draw")
+    await callback.message.answer("\n".join(lines))
     await callback.answer()
 
 
@@ -1015,25 +1105,164 @@ async def giveaway_start(callback: CallbackQuery):
 async def cmd_draw(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT user_id FROM giveaway").fetchall()
-    conn.close()
-    if not rows:
-        await message.answer("Никто не участвует.")
+    participants = get_giveaway_participants()
+    if not participants:
+        await message.answer(
+            "Никто не участвует.\n\n"
+            f"Опубликуй в канале ссылку t.me/{BOT_USERNAME}?start=giveaway"
+        )
         return
-    winner = random.choice(rows)[0]
+
+    count = len(participants)
     await message.answer(
-        f"Победитель розыгрыша: {winner}\n\n"
-        f"Всего участников: {len(rows)}")
+        f"Подтверди розыгрыш.\n\n"
+        f"Участников: {count}\n"
+        f"Будет выбран один случайный, ему придёт уведомление, "
+        f"а результат опубликуется в канал.\n\n"
+        f"После розыгрыша список участников очистится.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Провести розыгрыш", callback_data="draw_confirm")],
+            [InlineKeyboardButton(text="Отмена", callback_data="draw_cancel")],
+        ]))
+
+
+@dp.callback_query(F.data == "draw_cancel")
+async def draw_cancel(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    await callback.message.edit_text("Розыгрыш отменён.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "draw_confirm")
+async def draw_confirm(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    participants = get_giveaway_participants()
+    if not participants:
+        await callback.answer("Никто не участвует", show_alert=True)
+        return
+
+    winner = random.choice(participants)
+    count = len(participants)
+
+    await callback.message.edit_text(
+        f"Победитель: {winner}\n\n"
+        f"Всего участников: {count}\n\n"
+        f"Список участников очищен — можно запускать новый розыгрыш."
+    )
+    await callback.answer("Розыгрыш проведён")
+
     try:
-        await bot.send_message(winner, "Поздравляем! Ты выиграл розыгрыш «Тайного политеха».")
-    except Exception:
-        pass
+        await bot.send_message(
+            winner,
+            "Поздравляем! Ты выиграл розыгрыш «Тайного политеха».\n\n"
+            "Напиши администратору, чтобы забрать приз."
+        )
+    except Exception as e:
+        logging.error(f"[DRAW-NOTIFY] {e}")
+
+    try:
+        await bot.send_message(
+            CHANNEL_ID,
+            f"Розыгрыш завершён!\n\n"
+            f"Победитель выбран среди {count} участников.\n"
+            f"Поздравляем!"
+        )
+    except Exception as e:
+        logging.error(f"[DRAW-CHANNEL] {e}")
+
+    clear_giveaway()
 
 
 # ============================================================
-# ЕЖЕДНЕВНЫЙ ВОПРОС
+# БЫСТРЫЕ КОМАНДЫ
 # ============================================================
+@dp.message(Command("pending"))
+async def cmd_pending(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = get_pending_posts(limit=30)
+    if not rows:
+        await message.answer("Нет постов, ожидающих модерации.")
+        return
+    lines = [f"Ожидают модерации: {len(rows)}\n"]
+    for pid, cat, txt, uid, uname in rows:
+        short = txt[:80] + ("..." if len(txt) > 80 else "")
+        lines.append(f"#{pid} [{cat}] {short}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("queue"))
+async def cmd_queue(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = get_queue_list(limit=20)
+    if not rows:
+        await message.answer("Очередь пуста.")
+        return
+    lines = [f"Очередь: {len(rows)} постов\n"]
+    for pid, cat, txt in rows:
+        short = txt[:80] + ("..." if len(txt) > 80 else "")
+        lines.append(f"#{pid} [{cat}] {short}")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /ban <user_id>")
+        return
+    uid = int(parts[1])
+    ban_user(uid)
+    await message.answer(f"Пользователь {uid} забанен.")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /unban <user_id>")
+        return
+    uid = int(parts[1])
+    unban_user(uid)
+    await message.answer(f"Пользователь {uid} разбанен.")
+
+
+@dp.message(Command("post"))
+async def cmd_post(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.replace("/post", "", 1).strip()
+    if not text:
+        await message.answer("Использование: /post Текст")
+        return
+    try:
+        await bot.send_message(CHANNEL_ID, text)
+        await message.answer("Опубликовано.")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("question"))
+async def cmd_question(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    q = random.choice(DAILY_QUESTIONS)
+    try:
+        await bot.send_message(CHANNEL_ID, f"Вопрос дня:\n\n{q}\n\n#вопрос")
+        await message.answer(f"Опубликовано:\n{q}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
 @dp.callback_query(F.data == "daily_q_now")
 async def daily_q_now(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
