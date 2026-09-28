@@ -1,1 +1,1 @@
-# student_irk38_bot
+tainyi-politex
